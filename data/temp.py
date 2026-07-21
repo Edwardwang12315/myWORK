@@ -61,13 +61,14 @@ class WIDERDetection(data.Dataset):
         img = Image.open(img_path)
         # 针对TOG all & Domain adaptation
         # 在数据集中提前加载所有的配对图
-        I_light = Image.open(get_paired_path('illuminDay', img_path)).convert('RGB')
-        R_light = Image.open(get_paired_path('perturbDay', img_path)).convert('RGB')
-        I_dark = Image.open(get_paired_path('illuminNight', img_path)).convert('RGB')
-        R_dark = Image.open(get_paired_path('perturbNight', img_path)).convert('RGB')
+        I_light = Image.open(get_paired_path('illuminDay', img_path))
+        R_light = Image.open(get_paired_path('perturbDay', img_path))
+        I_dark = Image.open(get_paired_path('illuminNight', img_path))
+        R_dark = Image.open(get_paired_path('perturbNight', img_path))
         # 将所有图像打包传入新的预处理函数
         im_width, im_height = img.size
-        boxes = self.annotransform( np.array(self.boxes[index]), im_width, im_height)
+        boxes = self.annotransform(
+            np.array(self.boxes[index]), im_width, im_height)
         label = np.array(self.labels[index])
         bbox_labels = np.hstack((label[:, np.newaxis], boxes)).tolist()
 
@@ -77,9 +78,6 @@ class WIDERDetection(data.Dataset):
         
         return img, I_light, R_light, I_dark, R_dark, targets, img_path
 
-        # 原始代码
-        img, target, img_path, h, w = self.pull_item(index)
-        return img, target, img_path
 
     def pull_item(self, index):
         while True:
@@ -162,26 +160,12 @@ def detection_collate(batch):
     """
     targets = []
     imgs = []
-    # 新增数据集
-    I_light_list = []
-    R_light_list = []
-    I_dark_list = []
-    R_dark_list = []
-
     paths = []
     for sample in batch:
         imgs.append(sample[0])
-        # 新增数据集
-        I_light_list.append(sample[1])
-        R_light_list.append(sample[2])
-        I_dark_list.append(sample[3])
-        R_dark_list.append(sample[4])
-
-        targets.append(torch.FloatTensor(sample[5]))
-        paths.append(sample[6])
-    return torch.stack(imgs, 0), torch.stack(I_light_list, 0), torch.stack(R_light_list, 0), torch.stack(I_dark_list, 0), torch.stack(R_dark_list, 0), targets, paths
-
-# 暂放这里,后期要挪走
+        targets.append(torch.FloatTensor(sample[1]))
+        paths.append(sample[2])
+    return torch.stack(imgs, 0), targets, paths
 
 def get_paired_path(subdir, img_path, base_dir='/home/share/lowdetect/dataset/myWORK/'):
     """从子目录加载图像，返回 [0,1] tensor"""
@@ -348,14 +332,10 @@ def crop_image(img, bbox_labels, sample_bbox, image_width, image_height,
     ymin = int(sample_bbox.ymin * image_height)
     ymax = int(sample_bbox.ymax * image_height)
 
-    # 防止裁剪区域为空
-    if xmax <= xmin or ymax <= ymin:
-        # 返回原图和未过滤标签（后续可再处理）
-        return img.copy(), bbox_labels  # 直接返回原图副本
-    
-    sample_img = img[ymin:ymax, xmin:xmax].copy()
+    sample_img = img[ymin:ymax, xmin:xmax]
+    resize_val = resize_width
     sample_labels = transform_labels_sampling(bbox_labels, sample_bbox,
-                                              resize_width, min_face_size)
+                                              resize_val, min_face_size)
     return sample_img, sample_labels
 
 def intersect_bbox(bbox1, bbox2):
@@ -395,7 +375,6 @@ def jaccard_numpy(box_a, box_b):
     return inter / union  # [A,B]
 
 def anchor_crop_image_sampling(img, bbox_labels, scale_array, img_width, img_height):
-    # 保持输入的img为uint8
     mean = np.array([104, 117, 123], dtype=np.float32)
     maxSize = 12000  # max size
     infDistance = 9999999
@@ -509,61 +488,26 @@ def anchor_crop_image_sampling(img, bbox_labels, scale_array, img_width, img_hei
         current_boxes[:, 2:] -= choice_box[:2]
 
         if choice_box[0] < 0 or choice_box[1] < 0:
-            # 处理所有越界情况（左上、右下、全外部）
-            x1, y1, x2, y2 = choice_box
-            crop_w = x2 - x1
-            crop_h = y2 - y1
+            new_img_width = width if choice_box[0] >= 0 else width - choice_box[0]
+            new_img_height = height if choice_box[1] >= 0 else height - choice_box[1]
+            image_pad = np.zeros( (new_img_height, new_img_width, 3), dtype=float)
+            image_pad[:, :, :] = mean
+            start_left = 0 if choice_box[0] >= 0 else -choice_box[0]
+            start_top = 0 if choice_box[1] >= 0 else -choice_box[1]
+            image_pad[start_top:, start_left:, :] = image
 
-            # 如果裁剪框完全在图像外，返回均值填充图
-            if x1 >= width or y1 >= height or x2 <= 0 or y2 <= 0:
-                current_image = np.zeros((crop_h, crop_w, 3), dtype=np.uint8)
-                current_image[:, :] = mean.astype(np.uint8)
-                # 此时没有任何人脸，标签为空
-                return current_image, np.empty((0, 5))
+            choice_box_w = choice_box[2] - choice_box[0]
+            choice_box_h = choice_box[3] - choice_box[1]
 
-            # 计算有效相交区域
-            x1_clip = max(x1, 0)
-            y1_clip = max(y1, 0)
-            x2_clip = min(x2, width)
-            y2_clip = min(y2, height)
+            start_left = choice_box[0] if choice_box[0] >= 0 else 0
+            start_top = choice_box[1] if choice_box[1] >= 0 else 0
 
-            # 裁剪有效区域
-            roi = image[y1_clip:y2_clip, x1_clip:x2_clip].copy()
+            end_right = start_left + choice_box_w
+            end_bottom = start_top + choice_box_h
 
-            if x1 >= 0 and y1 >= 0 and x2 <= width and y2 <= height:
-                # 完全在图像内部
-                current_image = roi
-            else:
-                # 部分越界，创建填充画布
-                current_image = np.zeros((crop_h, crop_w, 3), dtype=np.uint8)
-                current_image[:, :] = mean.astype(np.uint8)
-                paste_x = x1_clip - x1
-                paste_y = y1_clip - y1
-                current_image[paste_y:paste_y+roi.shape[0], paste_x:paste_x+roi.shape[1]] = roi
-
-
-            # new_img_width = width if choice_box[0] >= 0 else width - choice_box[0]
-            # new_img_height = height if choice_box[1] >= 0 else height - choice_box[1]
-            # # 使用uint8填充均值
-            # mean_uint8 = mean.astype(np.uint8)
-            # image_pad = np.zeros( (new_img_height, new_img_width, 3), dtype=float)
-            # image_pad[:, :, :] = mean_uint8
-            # start_left = 0 if choice_box[0] >= 0 else -choice_box[0]
-            # start_top = 0 if choice_box[1] >= 0 else -choice_box[1]
-            # image_pad[start_top:, start_left:, :] = image
-
-            # choice_box_w = choice_box[2] - choice_box[0]
-            # choice_box_h = choice_box[3] - choice_box[1]
-
-            # start_left = choice_box[0] if choice_box[0] >= 0 else 0
-            # start_top = choice_box[1] if choice_box[1] >= 0 else 0
-
-            # end_right = start_left + choice_box_w
-            # end_bottom = start_top + choice_box_h
-
-            # current_image = image_pad[start_top:end_bottom, start_left:end_right, :].copy()
-
+            current_image = image_pad[start_top:end_bottom, start_left:end_right, :].copy()
             image_height, image_width, _ = current_image.shape
+
             if cfg.filter_min_face:
                 bbox_w = current_boxes[:, 2] - current_boxes[:, 0]
                 bbox_h = current_boxes[:, 3] - current_boxes[:, 1]
@@ -652,72 +596,41 @@ def apply_anchor_transform_to_paired(img_array, transform_params):
         return image
         
     # 3. 如果主图执行了裁剪
-    choice_box = transform_params['choice_box']      # [x1, y1, x2, y2]  绝对像素坐标（相对于缩放后图像）
-    x1, y1, x2, y2 = choice_box
-    crop_w = x2 - x1
-    crop_h = y2 - y1
-    h, w = image.shape[:2]
-
-    # 如果裁剪框完全在图像外，直接返回全黑图像
-    if x1 >= w or y1 >= h or x2 <= 0 or y2 <= 0:
-        return np.zeros((crop_h, crop_w, 3), dtype=np.uint8)
-
-    # 计算有效相交区域
-    x1_clipped = max(x1, 0)
-    y1_clipped = max(y1, 0)
-    x2_clipped = min(x2, w)
-    y2_clipped = min(y2, h)
-
-    # 裁剪有效区域
-    cropped = image[y1_clipped:y2_clipped, x1_clipped:x2_clipped].copy()
-
-    # 如果裁剪区域完全在图像内部，直接返回
-    if x1 >= 0 and y1 >= 0 and x2 <= w and y2 <= h:
-        return cropped
-
-    # 否则需要填充黑色
-    padded = np.zeros((crop_h, crop_w, 3), dtype=np.uint8)
-    # 计算有效区域在填充画布上的位置
-    paste_x = x1_clipped - x1
-    paste_y = y1_clipped - y1
-    padded[paste_y:paste_y + cropped.shape[0], paste_x:paste_x + cropped.shape[1]] = cropped
-    return padded
-
-    # choice_box = transform_params['choice_box']
-    # if choice_box[0] < 0 or choice_box[1] < 0:
-    #     # 情况 A: 越界，需要 Padding
-    #     height, width, _ = image.shape
-    #     new_img_width = width if choice_box[0] >= 0 else width - choice_box[0]
-    #     new_img_height = height if choice_box[1] >= 0 else height - choice_box[1]
+    choice_box = transform_params['choice_box']
+    if choice_box[0] < 0 or choice_box[1] < 0:
+        # 情况 A: 越界，需要 Padding
+        height, width, _ = image.shape
+        new_img_width = width if choice_box[0] >= 0 else width - choice_box[0]
+        new_img_height = height if choice_box[1] >= 0 else height - choice_box[1]
         
-    #     # 注意：光照/反射图填充黑色 (0) 是最安全的，不破坏物理特性
-    #     image_pad = np.zeros((new_img_height, new_img_width, 3), dtype=np.uint8)
+        # 注意：光照/反射图填充黑色 (0) 是最安全的，不破坏物理特性
+        image_pad = np.zeros((new_img_height, new_img_width, 3), dtype=image.dtype)
         
-    #     start_left = 0 if choice_box[0] >= 0 else -choice_box[0]
-    #     start_top = 0 if choice_box[1] >= 0 else -choice_box[1]
-    #     image_pad[start_top:, start_left:, :] = image
+        start_left = 0 if choice_box[0] >= 0 else -choice_box[0]
+        start_top = 0 if choice_box[1] >= 0 else -choice_box[1]
+        image_pad[start_top:, start_left:, :] = image
 
-    #     choice_box_w = choice_box[2] - choice_box[0]
-    #     choice_box_h = choice_box[3] - choice_box[1]
+        choice_box_w = choice_box[2] - choice_box[0]
+        choice_box_h = choice_box[3] - choice_box[1]
 
-    #     start_left = choice_box[0] if choice_box[0] >= 0 else 0
-    #     start_top = choice_box[1] if choice_box[1] >= 0 else 0
-    #     end_right = start_left + choice_box_w
-    #     end_bottom = start_top + choice_box_h
+        start_left = choice_box[0] if choice_box[0] >= 0 else 0
+        start_top = choice_box[1] if choice_box[1] >= 0 else 0
+        end_right = start_left + choice_box_w
+        end_bottom = start_top + choice_box_h
         
-    #     current_image = image_pad[start_top:end_bottom, start_left:end_right, :].copy()
-    #     return current_image
-    # else:
-    #     # 情况 B: 正常裁剪
-    #     current_image = image[choice_box[1]:choice_box[3], choice_box[0]:choice_box[2], :].copy()
-    #     return current_image
+        current_image = image_pad[start_top:end_bottom, start_left:end_right, :].copy()
+        return current_image
+    else:
+        # 情况 B: 正常裁剪
+        current_image = image[choice_box[1]:choice_box[3], choice_box[0]:choice_box[2], :].copy()
+        return current_image
     
 def sync_preprocess(image_list, bbox_labels, mode, cfg):
     """
     image_list: [img_main, I_light, R_light, I_dark, R_dark] (全为 PIL Image)
     """
-    img_main = image_list[0].convert('RGB')
-    paired_imgs = [im.convert('RGB') for im in image_list[1:]]
+    img_main = image_list[0]
+    paired_imgs = image_list[1:]
     img_width, img_height = img_main.size
     sampled_labels = bbox_labels
 
@@ -748,6 +661,7 @@ def sync_preprocess(image_list, bbox_labels, mode, cfg):
         #     paired_imgs = new_paired
 
         # ====== 3. 同步裁剪 (Anchor Crop) ======
+        batch_sampler = []
         prob = np.random.uniform(0., 1.)
         if prob > cfg.data_anchor_sampling_prob and cfg.anchor_sampling:
             scale_array = np.array([16, 32, 64, 128, 256, 512])
@@ -761,13 +675,13 @@ def sync_preprocess(image_list, bbox_labels, mode, cfg):
             
         else:
             # 常规 SSD 裁剪：本身就生成了 sampled_bbox，直接复用！
-            batch_sampler = [
-                sampler(1, 50, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, True),
-                sampler(1, 50, 0.3, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, True),
-                sampler(1, 50, 0.3, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, True),
-                sampler(1, 50, 0.3, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, True),
-                sampler(1, 50, 0.3, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, True),
-                ]
+            # 标准 SSD Crop
+            batch_sampler = []
+            batch_sampler.append(sampler(1, 50, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, True))
+            batch_sampler.append(sampler(1, 50, 0.3, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, True))
+            batch_sampler.append(sampler(1, 50, 0.3, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, True))
+            batch_sampler.append(sampler(1, 50, 0.3, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, True))
+            batch_sampler.append(sampler(1, 50, 0.3, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, True))
             
             sampled_bbox = generate_batch_samples(batch_sampler, bbox_labels, img_width, img_height)
             if len(sampled_bbox) > 0:
@@ -783,16 +697,10 @@ def sync_preprocess(image_list, bbox_labels, mode, cfg):
                     p_cropped, _ = crop_image(p_img, bbox_labels.copy(), box, img_width, img_height, cfg.resize_width, cfg.resize_height, cfg.min_face_size)
                     new_paired.append(p_cropped)
                 paired_imgs = new_paired
-        
-        # 确保所有图像是连续的、形状正确的 uint8 数组
-        def ensure_valid_image(arr):
-            arr = np.ascontiguousarray(arr).astype(np.uint8)
-            if arr.ndim != 3 or arr.shape[2] != 3 or arr.shape[0] == 0 or arr.shape[1] == 0:
-                raise ValueError(f"Invalid image shape: {arr.shape}")
-            return arr
+
         # 转回 PIL 供后续 Resize
-        img_main = Image.fromarray(ensure_valid_image(img_main))
-        paired_imgs = [Image.fromarray(ensure_valid_image(p)) for p in paired_imgs]
+        img_main = Image.fromarray(img_main.astype('uint8'))
+        paired_imgs = [Image.fromarray(p.astype('uint8')) for p in paired_imgs]
 
     # ====== 4. 同步 Resize ======
     interp_mode = [Image.BILINEAR, Image.HAMMING, Image.NEAREST, Image.BICUBIC, Image.LANCZOS]
@@ -800,25 +708,27 @@ def sync_preprocess(image_list, bbox_labels, mode, cfg):
     
     img_main = img_main.resize((cfg.resize_width, cfg.resize_height), resample=interp_mode[interp_indx])
     paired_imgs = [p.resize((cfg.resize_width, cfg.resize_height), resample=interp_mode[interp_indx]) for p in paired_imgs]
-    # 转 numpy
-    img_main = np.array(img_main).astype(np.uint8)
-    paired_imgs = [np.array(p).astype(np.uint8) for p in paired_imgs]
+
+    img_main = np.array(img_main)
+    paired_imgs = [np.array(p) for p in paired_imgs]
 
     # ====== 5. 同步水平翻转 (Mirror) ======
-    if mode == 'train' and np.random.randint(0, 2) == 1:
-        img_main = img_main[:, ::-1, :]
-        paired_imgs = [p[:, ::-1, :] for p in paired_imgs]
-        for i in range(len(sampled_labels)):
-            tmp = sampled_labels[i][1]
-            sampled_labels[i][1] = 1 - sampled_labels[i][3]
-            sampled_labels[i][3] = 1 - tmp
+    if mode == 'train':
+        if int(np.random.uniform(0, 2)) == 1:
+            img_main = img_main[:, ::-1, :]
+            paired_imgs = [p[:, ::-1, :] for p in paired_imgs]
+            for i in range(len(sampled_labels)):
+                tmp = sampled_labels[i][1]
+                sampled_labels[i][1] = 1 - sampled_labels[i][3]
+                sampled_labels[i][3] = 1 - tmp
 
     # ====== 6. 格式化输出 ======
     def format_tensor(img, apply_mean=False):
-        img = to_chw(img).astype('float32')
+        img = to_chw_bgr(img).astype('float32')
         if apply_mean:
             img -= cfg.img_mean # 检测器主图需要减均值
-        return torch.from_numpy(img)
+        img = img[[2, 1, 0], :, :] # 转 RGB
+        return img
 
     img_main = format_tensor(img_main, apply_mean=True)
     # 对于增强网络的图，不减均值，保持物理意义，转为 0~1 的张量
@@ -859,7 +769,7 @@ def transform_labels_sampling(bbox_labels, sample_bbox, resize_val,
 
     return sample_labels
 
-def to_chw(image):
+def to_chw_bgr(image):
     """
     Transpose image from HWC to CHW and from RBG to BGR.
     Args:
@@ -867,7 +777,10 @@ def to_chw(image):
     """
     # HWC to CHW
     if len(image.shape) == 3:
-        return np.transpose(image, (2, 0, 1))
+        image = np.swapaxes(image, 1, 2)
+        image = np.swapaxes(image, 1, 0)
+    # RBG to BGR
+    image = image[[2, 1, 0], :, :]
     return image
 
 def meet_emit_constraint(src_bbox, sample_bbox):

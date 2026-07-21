@@ -381,10 +381,10 @@ if __name__ == '__main__':
     # USE_MULTI_SCALE = False
     # MY_SHRINK = 2
 
-    save_path = './result'
+    save_path = '/home/share/lowdetect/dataset/myWORK/result'
 
     def load_images():
-      imglist = glob.glob('/home/share/lowdetect/dataset/DarkFace/image/*.png') # Set the dir of your test data
+      imglist = glob.glob('/home/share/lowdetect/dataset/myWORK/DarkFace/image/*.png') # Set the dir of your test data
       return imglist
 
     ''' Main Test '''

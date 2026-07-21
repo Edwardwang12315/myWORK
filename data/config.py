@@ -24,7 +24,7 @@ _C.brightness_prob = 0.5
 _C.brightness_delta = 0.125
 _C.data_anchor_sampling_prob = 0.5
 _C.min_face_size = 6.0
-_C.apply_distort = True
+_C.apply_distort = False
 _C.apply_expand = False
 # Modified to fit the input requirement of DARK ISP
 _C.img_mean = np.array([0., 0., 0.])[:, np.newaxis, np.newaxis].astype(

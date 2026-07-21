@@ -293,29 +293,6 @@ class DSFD(nn.Module):
 		loc_pal2 = list()
 		conf_pal2 = list()
 
-		# 控制深层检测网络权重冻结
-		pal1_c_sources = list()
-		pal2_c_sources = list()
-		loc_pal1_c = list()
-		conf_pal1_c = list()
-		loc_pal2_c = list()
-		conf_pal2_c = list()
-
-		deep_modules = [
-			self.vgg[5:],
-			self.extras,
-			self.fpn_topdown,
-			self.fpn_latlayer,
-			self.fpn_fem,
-			self.loc_pal1, self.conf_pal1,
-			self.loc_pal2, self.conf_pal2,
-			self.L2Normof1, self.L2Normof2, self.L2Normof3,
-			self.L2Normef1, self.L2Normef2, self.L2Normef3,
-		]
-		for m in deep_modules:
-			for param in m.parameters():
-				param.requires_grad = True
-
 		# 检测主线和Retinex主线分离
 		# apply vgg up to conv4_3 relu
 		# x输入暗图 xlight输入亮图
@@ -327,8 +304,7 @@ class DSFD(nn.Module):
 			# x检测通路的输入
 			if k == 4:
 				x_dark = x
-				# xlight、xdark分解通路的输入
-
+				
 		# extract the shallow features and forward them into the reflectance branch:
 		# R_dark、R_light是对应的反射图
 		R_dark = self.ref(x_dark)
@@ -497,7 +473,7 @@ class DSFD(nn.Module):
 		
 		# packing the outputs from the reflectance decoder:
 		return output, [R_dark, R_light, \
-				#   R_dark_2, R_light_2 \
+				  R_dark_2, R_light_2 \
 					], loss_mutual
 
 	def forward_detection(self, img):
@@ -628,7 +604,6 @@ class DSFD(nn.Module):
 				self.priors_pal2)
 			
 		return output
-
 
 	def load_weights(self, base_file):
 		other, ext = os.path.splitext(base_file)

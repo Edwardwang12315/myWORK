@@ -26,6 +26,8 @@ from utils.DarkISP import Low_Illumination_Degrading
 from utils.attack_utils import targeted_attack_on_reflectance
 from PIL import Image
 from torchvision.utils import save_image
+from utils.augmentations import preprocess
+import torchvision.transforms.functional as TF
 
 parser = argparse.ArgumentParser(
     description='DSFD face Detector Training With Pytorch')
@@ -69,12 +71,15 @@ parser.add_argument('--local_rank',
                     help='local rank for dist')
 
 # 单独训练检测攻击
-parser.add_argument('--TOG_Day', action='store_true', help='train disturbance on day detection only')
-parser.add_argument('--TOG_Night', action='store_true', help='train disturbance on night detection only')
+parser.add_argument('--TOG_all', action='store_true', help='train disturbance on night detection only')
+parser.add_argument('--Save_perturb_dir', type=str, default='/home/share/lowdetect/dataset/myWORK/', help='Directory to save 昼夜扰动 images')
 
 # 单独训练暗亮图检测
 parser.add_argument('--DAY_Detection', action='store_true', help='train day detection only')
 parser.add_argument('--NIGHT_Detection', action='store_true', help='train night detection only')
+
+# 原始Domain adaptation
+parser.add_argument('--DA', action='store_true', help='原始的Domain Adaptation')
 
 args = parser.parse_args()
 global local_rank
@@ -82,15 +87,10 @@ local_rank = args.local_rank
 
 
 # 判断是否进行完整训练
-TOG_Day = args.TOG_Day
-TOG_Night = args.TOG_Night
 DAY_Detection = args.DAY_Detection
 NIGHT_Detection = args.NIGHT_Detection
-if (TOG_Day or TOG_Night or DAY_Detection or NIGHT_Detection):
-    Domain_adaptation = False
-else:
-    Domain_adaptation = True
-
+TOG_all = args.TOG_all
+Domain_adaptation = args.DA
 
 if 'LOCAL_RANK' not in os.environ:
     os.environ['LOCAL_RANK'] = str(args.local_rank)
@@ -118,7 +118,6 @@ if not os.path.exists(save_folder):
     os.mkdir(save_folder)
 
 train_dataset = WIDERDetection(cfg.FACE.TRAIN_FILE, mode='train')
-
 val_dataset = WIDERDetection(cfg.FACE.VAL_FILE, mode='val')
 train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset, shuffle=True)
 train_loader = data.DataLoader(train_dataset, args.batch_size,
@@ -134,9 +133,7 @@ val_loader = data.DataLoader(val_dataset, val_batchsize,
                              sampler=val_sampler,
                              pin_memory=True)
 
-
 min_loss = np.inf
-
 
 def train():
     per_epoch_size = len(train_dataset) // (args.batch_size * torch.cuda.device_count())
@@ -151,12 +148,31 @@ def train():
     net_enh = RetinexNet()
     net_enh.load_state_dict(torch.load(args.save_folder + 'decomp.pth'))
 
+    if TOG_all and (not Domain_adaptation):
+        weight_name = 'dsfd_day_best.pth'
+        weight_path = os.path.join(args.save_folder, 'dark', weight_name)
+        net_day = build_net('train', num_classes=cfg.NUM_CLASSES, model='dark')
+        net_day.eval()
+        net_day.load_state_dict(torch.load(weight_path))
+        if local_rank == 0:
+            print(f'Training disturbance only, loading {weight_path}...')
+
+        weight_name = 'dsfd_night_best.pth'
+        weight_path = os.path.join(args.save_folder, 'dark', weight_name)
+        net_night = build_net('train', num_classes=cfg.NUM_CLASSES, model='dark')
+        net_night.eval()
+        net_night.load_state_dict(torch.load(weight_path))
+        if local_rank == 0:
+            print(f'Training disturbance only, loading {weight_path}...')
+    
     # 中断恢复
     if args.resume:
         if local_rank == 0:
             print('Resuming training, loading {}...'.format(args.resume))
         start_epoch = net.load_weights(args.resume)
         iteration = start_epoch * per_epoch_size
+    elif TOG_all and (not Domain_adaptation):
+        start_epoch = cfg.EPOCHES - 1
     else:
         base_weights = torch.load(args.save_folder + basenet)
         if local_rank == 0:
@@ -165,9 +181,7 @@ def train():
             net.vgg.load_state_dict(base_weights)
         else:
             net.resnet.load_state_dict(base_weights)
-    if not args.resume:
-        if TOG_Day or TOG_Night:
-            start_epoch = cfg.EPOCHES - 1
+            
         if local_rank == 0:
             print('Initializing weights...')
         net.extras.apply(net.weights_init)
@@ -203,6 +217,9 @@ def train():
             # 采用数据并行模型，多gpu
             net = torch.nn.parallel.DistributedDataParallel(net.cuda(), find_unused_parameters=True)
             net_enh = torch.nn.parallel.DistributedDataParallel(net_enh.cuda())
+            if TOG_all and (not Domain_adaptation):
+                net_night = torch.nn.parallel.DistributedDataParallel(net_night.cuda(), find_unused_parameters=True)
+                net_day = torch.nn.parallel.DistributedDataParallel(net_day.cuda(), find_unused_parameters=True)
         # net = net.cuda()
         cudnn.benchmark = True
 
@@ -230,7 +247,11 @@ def train():
         loss_mu = 0
         loss_en = 0
 
-        for batch_idx, (images, targets, img_paths) in enumerate(train_loader):
+        # 原始代码
+        # for batch_idx, (images, targets, img_paths) in enumerate(train_loader):
+        # 针对TOG all & Domain adaptation
+        for batch_idx, (images, I_light, R_light, I_dark, R_dark, targets, img_paths) in enumerate(train_loader):
+        
             # print(f"this info is: {img_paths}")
             # print( len( train_loader ) )
             # exit()
@@ -242,77 +263,45 @@ def train():
             with torch.no_grad():
                 images = images.cuda() / 255.
                 targetss = [ann.cuda() for ann in targets]
-            if TOG_Night or NIGHT_Detection or Domain_adaptation:
+                # import sys; print(sys._getframe().f_lineno)
+                # print(f"TOG is {TOG_all}")
+                # exit()
+            if Domain_adaptation or TOG_all:
                 img_dark = torch.empty(size=(images.shape[0], images.shape[1], images.shape[2], images.shape[3])).cuda()
                 # Generation of degraded data and AET groundtruth
                 for i in range(images.shape[0]):
-                    img_dark[i], _ = Low_Illumination_Degrading(images[i])#ISP方法生成低照度图像
-
+                    with torch.no_grad():
+                        img_dark[i], _ = Low_Illumination_Degrading(images[i])#ISP方法生成低照度图像
+                        # import sys; print(sys._getframe().f_lineno)
+                        
             if iteration in cfg.LR_STEPS:
                 step_index += 1
                 adjust_learning_rate(optimizer, args.gamma, step_index)
 
             # 前向传播两个分支
             t0 = time.time()
-            if TOG_Night or NIGHT_Detection or Domain_adaptation:
+            if TOG_all or Domain_adaptation:
                 R_dark_gt, I_dark = net_enh(img_dark)
-            if TOG_Day or DAY_Detection or Domain_adaptation:
                 R_light_gt, I_light = net_enh(images)
-
-            if TOG_Night:
-                net.eval()  # 在生成扰动时，冻结检测网络参数
-                # ===== 添加扰动生成伪真值 =====
-                # 可选条件：仅当 epoch 大于某个值，或每隔几轮，或损失较低时触发
-                # if (epoch % 2 == 0) and local_rank == 0:  # 示例：仅 rank0 执行，避免多卡冲突
-                if True:  
-                    # 对 dark 反射图进行攻击（也可对 light 攻击，根据需要）
-                    adv_dark_list = []
-                    for i in range(R_dark_gt.shape[0]):   # batch_size 次
-                        # 1. 对暗图反射图添加扰动（独立）
-                        adv_d = targeted_attack_on_reflectance(
-                            net=net,
-                            criterion=criterion,
-                            ref_img=R_dark_gt[i:i+1],
-                            targets=[targetss[i]],
-                            eps=4/255.,
-                            eps_iter=0.5/255.,
-                            n_iter=10
-                        )
-                        adv_dark_list.append(adv_d)
-                    R_dark_gt = torch.cat(adv_dark_list, dim=0)
-                    net.train()
-
-                    # 保存扰动后的图像
-                    save_dir = os.path.join(save_folder, 'tog_night_results')
-                    os.makedirs(save_dir, exist_ok=True)
-                    for i in range(R_dark_gt.shape[0]):
-                        # 获取原始文件名（不含目录）
-                        orig_path = img_paths[i]
-                        base_name = os.path.basename(orig_path)   # 例如 "000001.jpg"
-                        # 保留原始扩展名
-                        save_path = os.path.join(save_dir, base_name)
-                        img = R_dark_gt[i].cpu().detach()  # [3, H, W]
-                        # 使用 torchvision 保存
-                        save_image(img, save_path)
+                # import sys; print(sys._getframe().f_lineno)
                 
-                # 若使用多卡，需广播到其他 rank
-                # if args.multigpu:
-                #     dist.broadcast(R_dark_gt, src=0)
-                
-                continue
-
-            elif TOG_Day:
-                net.eval()  # 在生成扰动时，冻结检测网络参数
+            if TOG_all and (not Domain_adaptation):
+                net_day.eval()  
+                net_night.eval()  # 在生成扰动时，冻结检测网络参数
                 # ===== 添加扰动生成伪真值 =====
                 # 可选条件：仅当 epoch 大于某个值，或每隔几轮，或损失较低时触发
                 # if (epoch % 2 == 0) and local_rank == 0:  # 示例：仅 rank0 执行，避免多卡冲突
                 if True:
-                    # 对 dark 反射图进行攻击（也可对 light 攻击，根据需要）
                     adv_light_list = []
-                    for i in range(R_dark_gt.shape[0]):   # batch_size 次
-                        # 2. 对亮图反射图添加扰动（完全独立的另一组）
+                    adv_dark_list = []
+                    for i in range(R_light_gt.shape[0]):   # batch_size 次
+                        # import sys; print(sys._getframe().f_lineno)
+                        # 对亮图扰动
+                        if local_rank == 0:
+                            print(f"[Batch {batch_idx}] Processing light image {i+1}/{R_light_gt.shape[0]}...")
+                        # 1. 对亮图反射图添加扰动（完全独立的另一组）
                         adv_l = targeted_attack_on_reflectance(
-                            net=net,
+                            net=net_day,
                             criterion=criterion,
                             ref_img=R_light_gt[i:i+1],
                             targets=[targetss[i]],  # 标注共用
@@ -321,20 +310,64 @@ def train():
                             n_iter=10
                         )
                         adv_light_list.append(adv_l)
+                        # 对暗图扰动
+                        if local_rank == 0:
+                            print(f"[Batch {batch_idx}] Processing dark image {i+1}/{R_dark_gt.shape[0]}...")
+                        # 1. 对亮图反射图添加扰动（完全独立的另一组）
+                        adv_d = targeted_attack_on_reflectance(
+                            net=net_night,
+                            criterion=criterion,
+                            ref_img=R_dark_gt[i:i+1],
+                            targets=[targetss[i]],  # 标注共用
+                            eps=4/255.,
+                            eps_iter=0.5/255.,
+                            n_iter=10
+                        )
+                        adv_dark_list.append(adv_d)
 
                     R_light_gt = torch.cat(adv_light_list, dim=0)
-                    net.train()
+                    R_dark_gt = torch.cat(adv_dark_list, dim=0)
+                    net_day.train()
+                    net_night.train()
 
                     # 保存扰动后的图像
-                    save_dir = os.path.join(save_folder, 'tog_day_results')
-                    os.makedirs(save_dir, exist_ok=True)
+                    save_illum = os.path.join(args.Save_perturb_dir, 'illuminDay')
+                    save_pertur = os.path.join(args.Save_perturb_dir, 'perturbDay')
+                    os.makedirs(save_illum, exist_ok=True)
+                    os.makedirs(save_pertur, exist_ok=True)
                     for i in range(R_light_gt.shape[0]):
                         # 获取原始文件名（不含目录）
                         orig_path = img_paths[i]
                         base_name = os.path.basename(orig_path)   # 例如 "000001.jpg"
                         # 保留原始扩展名
-                        save_path = os.path.join(save_dir, base_name)
+                        # 保存光照亮图
+                        save_path = os.path.join(save_illum, base_name)
+                        img = I_light[i].cpu().detach()  # [3, H, W]
+                        # 使用 torchvision 保存
+                        save_image(img, save_path)
+                        # 保存扰动亮图
+                        save_path = os.path.join(save_pertur, base_name)
                         img = R_light_gt[i].cpu().detach()  # [3, H, W]
+                        # 使用 torchvision 保存
+                        save_image(img, save_path)
+
+                    save_illum = os.path.join(args.Save_perturb_dir, 'illuminNight')
+                    save_pertur = os.path.join(args.Save_perturb_dir, 'perturbNight')
+                    os.makedirs(save_illum, exist_ok=True)
+                    os.makedirs(save_pertur, exist_ok=True)
+                    for i in range(R_dark_gt.shape[0]):
+                        # 获取原始文件名（不含目录）
+                        orig_path = img_paths[i]
+                        base_name = os.path.basename(orig_path)   # 例如 "000001.jpg"
+                        # 保留原始扩展名
+                        # 保存光照亮图
+                        save_path = os.path.join(save_illum, base_name)
+                        img = I_dark[i].cpu().detach()  # [3, H, W]
+                        # 使用 torchvision 保存
+                        save_image(img, save_path)
+                        # 保存扰动亮图
+                        save_path = os.path.join(save_pertur, base_name)
+                        img = R_dark_gt[i].cpu().detach()  # [3, H, W]
                         # 使用 torchvision 保存
                         save_image(img, save_path)
 
@@ -343,27 +376,22 @@ def train():
                 #     dist.broadcast(R_light_gt, src=0)
 
                 continue
-
+        if TOG_all and (not Domain_adaptation):
+            return 0
                 # ===== 新增结束 =====
-
+        if True:
             if DAY_Detection:
                 inputs = R_light_gt.detach()
             elif NIGHT_Detection:
                 inputs = R_dark_gt.detach()
-            elif TOG_Day:
-                inputs = R_light_gt
-            elif TOG_Night:
-                inputs = R_dark_gt
 
             if Domain_adaptation:
                 out, out2, loss_mutual = net(img_dark, images, I_dark.detach(), I_light.detach())
-            else:
+                R_dark, R_light, R_dark_2, R_light_2 = out2
+            elif DAY_Detection or NIGHT_Detection:
                 out= net.module.forward_detection(inputs)
+                R_dark, R_light = out
 
-            
-            if Domain_adaptation:
-                # R_dark, R_light, R_dark_2, R_light_2 = out2
-                R_dark, R_light = out2
                 # print( "After net:" )
                 # print( f"Allocated: {torch.cuda.memory_allocated() / 1024 ** 2:.2f} MB" )
                 # print( f"Cached:    {torch.cuda.memory_reserved() / 1024 ** 2:.2f} MB" )
@@ -375,12 +403,12 @@ def train():
             loss_l_pa12, loss_c_pal2 = criterion(out[3:], targetss)
 
             loss = loss_l_pa1l + loss_c_pal1 + loss_l_pa12 + loss_c_pal2
-
-            # loss_enhance = criterion_enhance([R_dark, R_light, R_dark_2, R_light_2, I_dark.detach(), I_light.detach()], images, img_dark) * 0.1
-            # loss_enhance2 = F.l1_loss(R_dark, R_dark_gt.detach()) + F.l1_loss(R_light, R_light_gt.detach()) + (
-            #             1. - ssim(R_dark, R_dark_gt.detach())) + (1. - ssim(R_light, R_light_gt.detach()))
-
             if Domain_adaptation:
+                loss_enhance = criterion_enhance([R_dark, R_light, R_dark_2, R_light_2, I_dark.detach(), I_light.detach()], images, img_dark) * 0.1
+                loss_enhance2 = F.l1_loss(R_dark, R_dark_gt.detach()) + F.l1_loss(R_light, R_light_gt.detach()) + (
+                            1. - ssim(R_dark, R_dark_gt.detach())) + (1. - ssim(R_light, R_light_gt.detach()))
+
+            if False:
                 sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).view(1,1,3,3)
                 sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).view(1,1,3,3)
                 def GradientLoss(pred, target):
@@ -406,7 +434,7 @@ def train():
                                 + (1. - ssim(R_light, R_light_gt.detach()))
                                 )
                 
-                loss += loss_enhance2 + loss_enhance + loss_mutual
+            loss += loss_enhance2 + loss_enhance + loss_mutual
 
             # 反向传播
             loss.backward()
@@ -463,33 +491,36 @@ def train():
 
 def val(epoch, net, dsfd_net, net_enh, criterion):
     net.eval()
+    net_enh.eval()
     step = 0
     losses = torch.tensor(0.).cuda()
     losses_enh = torch.tensor(0.).cuda()
     t1 = time.time()
 
-    for batch_idx, (images, targets, img_paths) in enumerate(val_loader):
-        with torch.no_grad():
-            if args.cuda:
-                images = images.cuda() / 255.
-                targets = [ann.cuda() for ann in targets]
-            else:
-                images = images / 255.
-                targets = [ann.cuda() for ann in targets]
-        if TOG_Night or NIGHT_Detection or Domain_adaptation:
-            images = torch.stack([Low_Illumination_Degrading(images[i])[0] for i in range(images.shape[0])],
-                               dim=0)
-        if DAY_Detection or NIGHT_Detection:
-            images,_ = net_enh(images)
-        out = net.module.test_forward(images)
+    with torch.no_grad():
+        for batch_idx, (images, targets, img_paths) in enumerate(val_loader):
+            with torch.no_grad():
+                if args.cuda:
+                    images = images.cuda() / 255.
+                    targets = [ann.cuda() for ann in targets]
+                else:
+                    images = images / 255.
+                    targets = [ann.cuda() for ann in targets]
+                if Domain_adaptation:
+                    images = torch.stack([Low_Illumination_Degrading(images[i])[0] for i in range(images.shape[0])],
+                                    dim=0)
+                if DAY_Detection or NIGHT_Detection:
+                    images,_ = net_enh(images)
+                out = net.module.test_forward(images)
 
-        # loss_l_pa1l, loss_c_pal1 = criterion(out[:3], targets)
-        loss_l_pa12, loss_c_pal2 = criterion(out, targets)
-        loss = loss_l_pa12 + loss_c_pal2
+            # loss_l_pa1l, loss_c_pal1 = criterion(out[:3], targets)
+            # import sys; print(sys._getframe().f_lineno)
+            loss_l_pa12, loss_c_pal2 = criterion(out, targets)
+            loss = loss_l_pa12 + loss_c_pal2
 
-        losses += loss.item()
-        step += 1
-    dist.reduce(losses, 0, op=dist.ReduceOp.SUM)
+            losses += loss.item()
+            step += 1
+        dist.reduce(losses, 0, op=dist.ReduceOp.SUM)
 
     tloss = losses / step / torch.cuda.device_count()
     t2 = time.time()
@@ -505,6 +536,8 @@ def val(epoch, net, dsfd_net, net_enh, criterion):
                 torch.save(dsfd_net.state_dict(), os.path.join(save_folder, 'dsfd_day_best.pth'))
             elif NIGHT_Detection:
                 torch.save(dsfd_net.state_dict(), os.path.join(save_folder, 'dsfd_night_best.pth'))
+            # elif TOG_all:
+            #     torch.save(dsfd_net.state_dict(), os.path.join(save_folder, 'dsfd_tog_best.pth'))
             elif Domain_adaptation:
                 torch.save(dsfd_net.state_dict(), os.path.join(save_folder, 'dsfd_da_best.pth'))
         min_loss = tloss
@@ -518,9 +551,55 @@ def val(epoch, net, dsfd_net, net_enh, criterion):
             torch.save(states, os.path.join(save_folder, 'dsfd_day_checkpoint.pth'))
         elif NIGHT_Detection:
             torch.save(states, os.path.join(save_folder, 'dsfd_night_checkpoint.pth'))
+        # elif TOG_all and (not Domain_adaptation):
+        #     torch.save(states, os.path.join(save_folder, 'dsfd_tog_checkpoint.pth'))
         elif Domain_adaptation:
             torch.save(states, os.path.join(save_folder, 'dsfd_da_checkpoint.pth'))
 
+def generate_retinex_data(save_retinex_dir):
+    """生成低光退化+Retinex分解的结果，保存为图像"""
+    # 初始化模型
+    net_enh = RetinexNet()
+    net_enh.load_state_dict(torch.load(args.save_folder + 'decomp.pth'))
+    if args.cuda:
+        net_enh = net_enh.cuda()
+    net_enh.eval()
+
+    # 数据集
+    path_day = os.path.join(save_retinex_dir, 'decom_DAY')
+    os.makedirs(path_day, exist_ok=True)
+    path_night = os.path.join(save_retinex_dir, 'decom_NIGHT')
+    os.makedirs(path_night, exist_ok=True)
+    
+    dataset = WIDERDetection(cfg.FACE.TRAIN_FILE, mode='train')
+    dataloader = data.DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, collate_fn=detection_collate)
+
+    print(f"Generating Retinex data from train set...")
+    for idx, (images, targets, img_paths) in enumerate(dataloader):
+        with torch.no_grad():
+            images = images.cuda() / 255.0 if args.cuda else images / 255.0
+            # 低光退化
+            img_dark, _ = Low_Illumination_Degrading(images[0])  # 单张 [C,H,W]
+            img_dark = img_dark.unsqueeze(0)  # [1,C,H,W]
+            # Retinex分解
+            R_day, I_day = net_enh(images)
+            R_night, I_night = net_enh(img_dark)
+
+            base = os.path.splitext(os.path.basename(img_paths[0]))[0]
+            ext = os.path.splitext(os.path.basename(img_paths[0]))[1]
+            # 保存 (转为0~255 uint8)
+            for name, tensor in zip(['reflectance', 'illumination'], [R, I]):
+                # tensor [1,3,H,W] 或 [1,1,H,W]（光照图可能是单通道）
+                # 如果是单通道，复制为3通道以便保存
+                if tensor.shape[1] == 1:
+                    tensor = tensor.repeat(1, 3, 1, 1)
+                # 保存
+                save_path = os.path.join(path_train, name, f"{base}{ext}")
+                save_image(tensor, save_path)  # 自动反归一化
+        if (idx+1) % 100 == 0:
+            print(f"Processed {idx+1} training images")
+
+    print("Done!")
 
 def adjust_learning_rate(optimizer, gamma, step):
     """Sets the learning rate to the initial LR decayed by 10 at every
@@ -532,6 +611,68 @@ def adjust_learning_rate(optimizer, gamma, step):
     for param_group in optimizer.param_groups:
         param_group['lr'] = param_group['lr'] * gamma
 
+def load_img_from_dir(subdir, img_path, base_dir=args.Save_perturb_dir):
+    """从子目录加载图像，返回 [0,1] tensor"""
+    fname = os.path.basename(img_path)
+    full_path = os.path.join(base_dir, subdir, fname)
+    if not os.path.exists(full_path):
+        raise FileNotFoundError(f"Missing {full_path}")
+    img = Image.open(full_path).convert('RGB')
+    return TF.to_tensor(img)
+
+def apply_sync_transforms_and_norm(images, img_dark, I_light, R_light_gt, I_dark, R_dark_gt, targets, cfg):
+    """
+    在 GPU 上同步对配对图像进行数据增强和格式归一化。
+    images 等输入此时应为 (B, C, H, W) 格式的 GPU Tensor，且数值范围应为 0~1 (因为之前除了 255.)。
+    """
+    B = images.shape[0]
+    device = images.device
+    
+    # 假设 cfg.img_mean 的原始顺序是 [B, G, R] (常见的 VGG 均值，如 104, 117, 123)
+    # 因为我们当前的数据是 RGB 顺序，我们需要把均值倒过来 [R, G, B] 用于减法
+    rgb_mean = [cfg.img_mean[2], cfg.img_mean[1], cfg.img_mean[0]]
+    mean_tensor = torch.tensor(rgb_mean, device=device).view(1, 3, 1, 1)
+
+    new_targets = []
+    
+    for i in range(B):
+        bbox = targets[i]
+        
+        # ====== 1. 同步随机水平翻转 (Mirror: 50% 概率) ======
+        if random.random() > 0.5:
+            # 翻转所有对应的图像 (dims=[2] 表示在 Width 维度翻转)
+            images[i] = torch.flip(images[i], dims=[2])
+            
+            if img_dark is not None:
+                img_dark[i] = torch.flip(img_dark[i], dims=[2])
+            if I_light is not None:
+                I_light[i] = torch.flip(I_light[i], dims=[2])
+            if R_light_gt is not None:
+                R_light_gt[i] = torch.flip(R_light_gt[i], dims=[2])
+            if I_dark is not None:
+                I_dark[i] = torch.flip(I_dark[i], dims=[2])
+            if R_dark_gt is not None:
+                R_dark_gt[i] = torch.flip(R_dark_gt[i], dims=[2])
+            
+            # 同步更新人脸框 (x_min 和 x_max 互换并用 1 减，假设 bbox 坐标已归一化)
+            if len(bbox) > 0:
+                tmp_xmin = bbox[:, 0].clone()
+                bbox[:, 0] = 1.0 - bbox[:, 2]
+                bbox[:, 2] = 1.0 - tmp_xmin
+                
+        new_targets.append(bbox)
+        
+    # ====== 2. 目标检测器的归一化 ======
+    # 【注意】你的 net_enh (Retinex) 可能需要 0~1 的数据，所以需要保留 0~1 的版本
+    # 但检测网络 (DSFD/VGG) 需要的是 (img * 255 - mean) 且为 RGB 格式 (根据原 preprocess 逻辑)
+    
+    # 创建给检测网络专用 (det_xxx) 的归一化图像
+    det_images = images * 255.0 - mean_tensor
+    det_img_dark = None
+    if img_dark is not None:
+        det_img_dark = img_dark * 255.0 - mean_tensor
+        
+    return images, img_dark, I_light, R_light_gt, I_dark, R_dark_gt, det_images, det_img_dark, new_targets
 
 if __name__ == '__main__':
     train()
